@@ -1,0 +1,12 @@
+# The one Python file is the image's helper command (no .py suffix).
+extend-include = ["rootfs/usr/local/bin/keffa-ci"]
+line-length = 110
+target-version = "py311"
+
+[lint]
+select = ["F", "E", "W", "I", "UP", "B", "RUF"]
+ignore = ["E501", "W191"]
+
+[format]
+quote-style = "double"
+indent-style = "tab"

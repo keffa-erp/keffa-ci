@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# Build time only: bake the test sites into the MariaDB datadir and write /etc/keffa-ci/info.json.
+#
+#   bake LINE
+#
+# The three sites hold exactly the upstream app sets the Keffa apps test on (their CI's DEPS and
+# SOFT_APPS), installed in that order and migrated, with allow_tests on.
+set -euo pipefail
+
+line=$1
+cd "$KEFFA_CI_BENCH"
+logs=/var/log/keffa-ci
+
+# name, then the apps to install in order
+SITES=(
+	"frappe.localhost"
+	"erpnext-hrms.localhost erpnext hrms"
+	"erpnext-payments-hrms.localhost erpnext payments hrms"
+)
+
+# Bench-wide settings: the local services, and the fixed CI passwords so that no command prompts.
+python3 - <<'PY'
+import json
+
+path = "sites/common_site_config.json"
+with open(path) as f:
+	config = json.load(f)
+config.update(
+	{
+		"db_host": "127.0.0.1",
+		"db_port": 3306,
+		"root_login": "root",
+		"root_password": "root",
+		"admin_password": "admin",
+		"frappe_user": "frappe",
+		"redis_cache": "redis://127.0.0.1:13000",
+		"redis_queue": "redis://127.0.0.1:11000",
+		"redis_socketio": "redis://127.0.0.1:11000",
+	}
+)
+with open(path, "w") as f:
+	json.dump(config, f, indent=1, sort_keys=True)
+PY
+
+mariadb-install-db --datadir=/var/lib/mysql --auth-root-authentication-method=normal --skip-test-db >"$logs/install-db.log" 2>&1
+# The root password is still empty here; keffa-ci's readiness ping only needs the server up.
+keffa-ci start
+# mariadb-install-db also makes root@127.0.0.1 and root@::1 with no password, and anonymous
+# users: a connection over 127.0.0.1 would match those before root@%. Give the loopback root
+# accounts the password and drop the anonymous ones. (Its root@<build hostname> never matches:
+# the container's hostname differs and skip-name-resolve is on.)
+{
+	mariadb -uroot -N -e "SELECT Host FROM mysql.user WHERE User = ''" |
+		while read -r host; do echo "DROP USER IF EXISTS ''@'$host';"; done
+	cat <<'SQL'
+ALTER USER IF EXISTS 'root'@'localhost' IDENTIFIED BY 'root';
+ALTER USER IF EXISTS 'root'@'127.0.0.1' IDENTIFIED BY 'root';
+ALTER USER IF EXISTS 'root'@'::1' IDENTIFIED BY 'root';
+CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY 'root';
+GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+SQL
+} | mariadb -uroot
+
+bake_site() {
+	local site=$1
+	shift
+	local install=()
+	for app in "$@"; do install+=(--install-app "$app"); done
+	bench new-site "$site" \
+		--admin-password admin \
+		--db-root-username root \
+		--db-root-password root \
+		--mariadb-user-host-login-scope=% \
+		"${install[@]}"
+	python3 - "$site" <<'PY'
+import json
+import sys
+
+path = f"sites/{sys.argv[1]}/site_config.json"
+with open(path) as f:
+	config = json.load(f)
+config["allow_tests"] = True
+with open(path, "w") as f:
+	json.dump(config, f, indent=1)
+PY
+	bench --site "$site" migrate
+	bench --site "$site" list-apps
+}
+
+# The three sites install in parallel: separate databases, and nothing bench-wide is written.
+pids=()
+for entry in "${SITES[@]}"; do
+	read -r -a words <<<"$entry"
+	bake_site "${words[@]}" >"$logs/bake-${words[0]}.log" 2>&1 &
+	pids+=("$!")
+done
+failed=0
+for i in "${!pids[@]}"; do
+	read -r -a words <<<"${SITES[$i]}"
+	if wait "${pids[$i]}"; then
+		echo "baked ${SITES[$i]}"
+	else
+		failed=1
+		echo "FAILED ${words[0]}:"
+		tail -40 "$logs/bake-${words[0]}.log"
+	fi
+done
+[ "$failed" = 0 ]
+
+# What the image holds, for `keffa-ci info` and the labels the workflow adds.
+python3 - "$line" "${SITES[@]}" <<'PY'
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+
+def out(*cmd, cwd=None):
+	return subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=cwd).stdout.strip()
+
+
+line, sites = sys.argv[1], sys.argv[2:]
+bench = os.environ["KEFFA_CI_BENCH"]
+apps = {}
+with open(f"{bench}/sites/apps.txt") as f:
+	for app in (a.strip() for a in f if a.strip()):
+		path = f"{bench}/apps/{app}"
+		version = out(f"{bench}/env/bin/python", "-c", f"import {app}; print({app}.__version__)")
+		apps[app] = {
+			"commit": out("git", "-C", path, "rev-parse", "HEAD"),
+			"branch": out("git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"),
+			"version": version,
+		}
+mariadb = out("mariadbd", "--version").split()
+info = {
+	"line": line,
+	"built": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+	"bench_path": bench,
+	"apps": apps,
+	"versions": {
+		"python": out(f"{bench}/env/bin/python", "-c", "import platform; print(platform.python_version())"),
+		"node": out("node", "--version").lstrip("v"),
+		"yarn": out("yarn", "--version"),
+		"mariadb": mariadb[mariadb.index("Ver") + 1].split("-")[0],
+		"redis": out("redis-server", "--version").split("v=")[1].split()[0],
+		"bench": out("bench", "--version"),
+		"wkhtmltopdf": out("wkhtmltopdf", "--version").split()[1],
+		"debian": open("/etc/debian_version").read().strip(),
+	},
+	"sites": {entry.split()[0]: entry.split()[1:] for entry in sites},
+	"admin_password": "admin",
+	"db_root_password": "root",
+}
+with open("/etc/keffa-ci/info.json", "w") as f:
+	json.dump(info, f, indent=1)
+print(json.dumps(info, indent=1))
+PY
+
+# A clean, slow shutdown: the redo log is empty and the purge done, so the first start of every
+# container has nothing to recover.
+mariadb -uroot -proot -e "SET GLOBAL innodb_fast_shutdown = 0"
+keffa-ci stop
+rm -rf "${logs:?}"/* logs/*.log "$HOME/.cache" /tmp/* 2>/dev/null || true

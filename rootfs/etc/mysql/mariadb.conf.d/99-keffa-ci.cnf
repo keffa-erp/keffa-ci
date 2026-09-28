@@ -1,0 +1,42 @@
+# keffa-ci: MariaDB for throwaway test data. Loaded after Debian's 50-server.cnf, so these win.
+
+[mysqld]
+# The image user owns the datadir; started as root, mariadbd switches to it.
+user = frappe
+datadir = /var/lib/mysql
+socket = /run/mysqld/mysqld.sock
+pid-file = /run/mysqld/mysqld.pid
+log_error = /var/log/keffa-ci/mariadb.log
+bind-address = 127.0.0.1
+port = 3306
+skip-name-resolve
+
+# What Frappe requires (frappe_docker's compose files, Frappe's install docs).
+character-set-server = utf8mb4
+collation-server = utf8mb4_unicode_ci
+skip-character-set-client-handshake
+innodb_file_per_table = 1
+max_allowed_packet = 256M
+
+# Test data is thrown away with the container: no binary log, no flushing to disk on commit,
+# no doublewrite buffer. A crash loses the last second of writes, which a CI job never needs.
+skip-log-bin
+sync_binlog = 0
+innodb_flush_log_at_trx_commit = 0
+innodb_doublewrite = 0
+
+# Fast start and small footprint. Native AIO is off: containers may block io_uring and libaio
+# on overlay filesystems.
+innodb_use_native_aio = 0
+innodb_buffer_pool_size = 256M
+innodb_log_file_size = 64M
+innodb_buffer_pool_load_at_startup = 0
+innodb_buffer_pool_dump_at_shutdown = 0
+performance_schema = 0
+
+[client]
+default-character-set = utf8mb4
+socket = /run/mysqld/mysqld.sock
+
+[mysql]
+default-character-set = utf8mb4

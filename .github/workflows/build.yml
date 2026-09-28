@@ -1,0 +1,160 @@
+name: Build
+
+# Builds one image per Frappe line, smoke-tests it, then pushes it to
+# ghcr.io/<owner>/keffa-ci as <line>, <line>-<YYYYMMDD> and <line>-<frappe commit, 12>.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      lines:
+        description: The lines to build (space-separated)
+        default: version-15 version-16 develop
+  schedule:
+    # Daily; a line whose upstream commits equal the published image's labels is skipped.
+    - cron: '23 2 * * *'
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Image name
+        id: image
+        env:
+          OWNER: ${{ github.repository_owner }}
+        # GHCR names are lowercase.
+        run: echo "image=ghcr.io/${OWNER,,}/keffa-ci" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve the upstream commits; skip current lines on the schedule
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          LINES_INPUT: ${{ inputs.lines }}
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: scripts/plan.sh | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.line }}
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      IMAGE: ${{ needs.plan.outputs.image }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free disk space
+        # The build, its cache and the loaded image need about 15 GB; the runner's preinstalled
+        # SDKs are not used here.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Tags and build arguments
+        id: meta
+        env:
+          LINE: ${{ matrix.line }}
+          FRAPPE: ${{ matrix.frappe }}
+        run: |
+          {
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "tags<<EOF"
+            echo "$IMAGE:$LINE"
+            echo "$IMAGE:$LINE-$(date -u +%Y%m%d)"
+            echo "$IMAGE:$LINE-${FRAPPE:0:12}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: |
+            LINE=${{ matrix.line }}
+            PYTHON_VERSION=${{ matrix.python }}
+            NODE_VERSION=${{ matrix.node }}
+            FRAPPE_COMMIT=${{ matrix.frappe }}
+            ERPNEXT_COMMIT=${{ matrix.erpnext }}
+            PAYMENTS_COMMIT=${{ matrix.payments }}
+            HRMS_COMMIT=${{ matrix.hrms }}
+            BUILD_DATE=${{ steps.meta.outputs.created }}
+            SOURCE=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=${{ matrix.line }}
+          cache-to: type=gha,scope=${{ matrix.line }},mode=max
+          provenance: false
+          load: true
+          tags: keffa-ci:test
+
+      - name: Smoke test
+        run: scripts/smoke-test.sh keffa-ci:test
+
+      - name: Version labels
+        id: labels
+        run: |
+          {
+            echo "labels<<EOF"
+            scripts/version-labels.sh keffa-ci:test
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Push
+        # The same build again, every layer cached; only the labels the built image knows are new.
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: |
+            LINE=${{ matrix.line }}
+            PYTHON_VERSION=${{ matrix.python }}
+            NODE_VERSION=${{ matrix.node }}
+            FRAPPE_COMMIT=${{ matrix.frappe }}
+            ERPNEXT_COMMIT=${{ matrix.erpnext }}
+            PAYMENTS_COMMIT=${{ matrix.payments }}
+            HRMS_COMMIT=${{ matrix.hrms }}
+            BUILD_DATE=${{ steps.meta.outputs.created }}
+            SOURCE=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=${{ matrix.line }}
+          provenance: false
+          labels: ${{ steps.labels.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          push: true

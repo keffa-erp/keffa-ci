@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Build time only: put one upstream Frappe app into the bench, at an exact commit.
+#
+#   get-app APP LINE [COMMIT]
+#
+# APP is frappe (bench init), erpnext, payments or hrms. The app is cloned shallow from
+# github.com/frappe on the LINE branch (with retries: a stalled fetch fails fast and is tried
+# again), moved to COMMIT when the branch has gone past it since the caller resolved it, and only
+# then handed to bench, so the image holds exactly the commits its labels name.
+set -euo pipefail
+
+app=$1
+line=$2
+commit=${3:-}
+bench_dir=${KEFFA_CI_BENCH:?}
+url=https://github.com/frappe/$app
+src=/tmp/keffa-ci-src/$app
+
+# Abort a transfer that stalls (under 1 KB/s for 60 s) instead of hanging the build.
+git_net() { git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 "$@"; }
+
+fetched=0
+for try in 1 2 3 4 5; do
+	rm -rf "$src"
+	if git_net clone --quiet --depth 1 --branch "$line" "$url" "$src"; then
+		if [ -z "$commit" ] || [ "$(git -C "$src" rev-parse HEAD)" = "$commit" ]; then
+			fetched=1
+			break
+		fi
+		echo "$app: $line has moved past $commit; fetching that commit"
+		if git_net -C "$src" fetch --quiet --depth 1 origin "$commit"; then
+			git -C "$src" checkout --quiet -B "$line" "$commit"
+			fetched=1
+			break
+		fi
+	fi
+	echo "$app: fetch failed (try $try); retrying in $((try * 10)) s"
+	sleep $((try * 10))
+done
+[ "$fetched" = 1 ] || {
+	echo "$app: could not fetch $url $line ${commit}" >&2
+	exit 1
+}
+
+if [ "$app" = frappe ]; then
+	bench init "$bench_dir" \
+		--frappe-path "$src" \
+		--frappe-branch "$line" \
+		--python "$(command -v python3)" \
+		--skip-redis-config-generation \
+		--skip-assets \
+		--no-backups
+else
+	cd "$bench_dir"
+	bench get-app --skip-assets "$src"
+fi
+
+# bench cloned from the local copy: point the app back at GitHub, as a normal get-app would.
+dir=$bench_dir/apps/$app
+git -C "$dir" remote set-url upstream "$url"
+echo "$app $(git -C "$dir" rev-parse HEAD)"
+
+# The source copy only costs image size (the uv and yarn caches are a BuildKit cache mount).
+rm -rf "$src" "$HOME/.npm" "$HOME/.yarn"
