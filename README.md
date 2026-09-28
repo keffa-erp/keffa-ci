@@ -48,8 +48,7 @@ pull it in well under a minute.
 | Tag | Moves | Example |
 |---|---|---|
 | `<line>` | on every rebuild | `version-16` |
-| `<line>-<YYYYMMDD>` | never (the build of that day) | `version-16-20260928` |
-| `<line>-<frappe commit, 12 chars>` | never (the Frappe commit it holds) | `version-16-012667b9c4e7` |
+| `<line>-run-<run id>-<attempt>` | never (one per workflow run and retry) | `version-16-run-123456789-1` |
 
 The lines, with the Python and Node Frappe's own CI uses for each:
 
@@ -59,7 +58,11 @@ The lines, with the Python and Node Frappe's own CI uses for each:
 | `version-16` | `version-16` | 3.14 | 24 | 10.11 | 7.0 |
 | `develop` | `develop` | 3.14 | 24 | 10.11 | 7.0 |
 
-Pin a dated tag when a job must not change under you; use the line tag to follow upstream.
+Use the line tag to follow upstream, or a run tag to select a particular build; the upstream
+commits a build holds are in its `et.keffa.ci.<app>.commit` labels. A registry tag can still be
+moved by hand, so for a pin that cannot change use the image digest:
+`ghcr.io/keffa-erp/keffa-ci@sha256:<digest>` (shown by
+`docker buildx imagetools inspect ghcr.io/keffa-erp/keffa-ci:<tag>`).
 
 ## What's inside
 
@@ -190,10 +193,11 @@ The image runs as `frappe`, **uid and gid 1001**, which owns the bench and the M
   those commits in its labels, without building anything. Each line then builds with buildx and
   the GitHub Actions cache, is smoke-tested (`scripts/smoke-test.sh`: services, `list-apps` on
   every site, a no-op migrate, site selection, a generated app installed and uninstalled, and
-  one Frappe test module), and only then is pushed with its three tags, in a second, fully cached
+  one Frappe test module), and only then is pushed with its line and run tags, in a second, fully cached
   build pass that adds the version labels.
 - Locally: `scripts/build.sh <line>` does the same without pushing. It uses the buildx builder
-  named `default` (the local engine) unless `BUILDER` says otherwise.
+  named `default` (the local engine) unless `BUILDER` says otherwise. Both build passes load the
+  image into the local engine, including when using a Docker-container builder.
 
 Measured on a local machine (2026-09-28):
 
@@ -204,6 +208,9 @@ Measured on a local machine (2026-09-28):
 | develop | 371 s | 270 s | 3.20 GB |
 
 A rebuild after an upstream commit reuses every layer above the app that changed.
+
+Run the failure-path regression checks with `python3 -m unittest discover -s tests -v`.
+They need Python 3.11+, Bash and jq, and use disposable command fixtures without Docker or network access.
 
 ## Testing an app locally the way CI does
 

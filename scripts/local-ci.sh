@@ -158,7 +158,10 @@ run() {
 		else echo no package.json; fi"
 
 	local modules module mstart mrc passed=0 failed_modules=() tests_started=$SECONDS
-	modules=$(docker exec --workdir "$ws" "$name" find "$APP" -name 'test_*.py' -not -path '*/tests/unit/*' | sort)
+	if ! modules=$(docker exec --workdir "$ws" "$name" find "$APP" -name 'test_*.py' -not -path '*/tests/unit/*' 2>>"$log" | sort); then
+		record "discover site tests" $((SECONDS - tests_started)) "FAILED (see log)"
+		return 1
+	fi
 	for module in $modules; do
 		module=${module%.py}
 		module=${module//\//.}

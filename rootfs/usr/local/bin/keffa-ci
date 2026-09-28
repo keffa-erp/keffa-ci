@@ -69,32 +69,41 @@ def port_open(port: int) -> bool:
 		return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def redis_ping(port: int) -> bool:
+def redis_ping(port: int, timeout: float = 0.5) -> bool:
+	if timeout <= 0:
+		return False
 	try:
-		with socket.create_connection(("127.0.0.1", port), timeout=0.5) as s:
+		with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
 			s.sendall(b"PING\r\n")
 			return s.recv(16).startswith(b"+PONG")
 	except OSError:
 		return False
 
 
-def db_ready() -> bool:
+def db_ready(timeout: float = 2.0) -> bool:
 	# The listening port opens only after InnoDB has started, but ask a real question anyway.
-	if not port_open(DB_PORT):
+	if timeout <= 0 or not port_open(DB_PORT):
 		return False
-	return (
-		subprocess.run(
-			["mariadb-admin", "-uroot", f"-p{DB_ROOT_PASSWORD}", "-h127.0.0.1", "ping"],
-			capture_output=True,
-		).returncode
-		== 0
-	)
+	try:
+		return (
+			subprocess.run(
+				["mariadb-admin", "-uroot", f"-p{DB_ROOT_PASSWORD}", "-h127.0.0.1", "ping"],
+				capture_output=True,
+				timeout=timeout,
+			).returncode
+			== 0
+		)
+	except subprocess.TimeoutExpired:
+		return False
 
 
-def status() -> dict[str, bool]:
-	state = {"mariadb": db_ready()}
+def status(deadline: float | None = None) -> dict[str, bool]:
+	def timeout(limit: float) -> float:
+		return limit if deadline is None else max(0.0, min(limit, deadline - time.monotonic()))
+
+	state = {"mariadb": db_ready(timeout=timeout(2.0))}
 	for name, port in REDIS.items():
-		state[f"redis-{name}"] = redis_ping(port)
+		state[f"redis-{name}"] = redis_ping(port, timeout=timeout(0.5))
 	return state
 
 
@@ -147,7 +156,7 @@ def start(quiet: bool = False) -> None:
 
 	deadline = began + READY_TIMEOUT
 	while True:
-		state = status()
+		state = status(deadline=deadline)
 		if all(state.values()):
 			break
 		for name, proc in procs.items():

@@ -1,7 +1,7 @@
 name: Build
 
 # Builds one image per Frappe line, smoke-tests it, then pushes it to
-# ghcr.io/<owner>/keffa-ci as <line>, <line>-<YYYYMMDD> and <line>-<frappe commit, 12>.
+# ghcr.io/<owner>/keffa-ci as <line> and <line>-run-<run id>-<attempt>.
 on:
   push:
     branches: [main]
@@ -35,6 +35,9 @@ jobs:
       image: ${{ steps.image.outputs.image }}
     steps:
       - uses: actions/checkout@v6
+
+      - name: Regression tests
+        run: python3 -m unittest discover -s tests -v
 
       - name: Image name
         id: image
@@ -85,16 +88,7 @@ jobs:
         id: meta
         env:
           LINE: ${{ matrix.line }}
-          FRAPPE: ${{ matrix.frappe }}
-        run: |
-          {
-            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "tags<<EOF"
-            echo "$IMAGE:$LINE"
-            echo "$IMAGE:$LINE-$(date -u +%Y%m%d)"
-            echo "$IMAGE:$LINE-${FRAPPE:0:12}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+        run: scripts/build-meta.sh >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v4
 

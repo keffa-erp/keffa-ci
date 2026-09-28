@@ -3,7 +3,7 @@
 #   LINE: version-15, version-16 or develop. Builds keffa-ci:LINE (or $IMAGE:LINE) locally:
 #   resolves the upstream commits (git ls-remote), builds, then adds the version labels in a
 #   second, cached pass. Uses the buildx builder $BUILDER (default: "default", the local docker
-#   engine), never pushes.
+#   engine), loads both passes into the local engine, never pushes.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=scripts/lines.sh
@@ -21,6 +21,7 @@ image=${IMAGE:-keffa-ci}:$line
 args=(
 	--builder "${BUILDER:-default}"
 	--platform linux/amd64
+	--load
 	--build-arg "LINE=$line"
 	--build-arg "PYTHON_VERSION=$python"
 	--build-arg "NODE_VERSION=$node"
@@ -36,7 +37,13 @@ started=$SECONDS
 docker buildx build "${args[@]}" --tag "$image" "$@" "$here"
 echo "built $image in $((SECONDS - started)) s"
 
+# A plain assignment, so set -e stops on the helper's failure (process substitution would hide it).
+version_labels=$("$here/scripts/version-labels.sh" "$image")
 labels=()
-while IFS= read -r label; do labels+=(--label "$label"); done < <("$here/scripts/version-labels.sh" "$image")
+while IFS= read -r label; do [ -z "$label" ] || labels+=(--label "$label"); done <<<"$version_labels"
+[ ${#labels[@]} -gt 0 ] || {
+	echo "no version labels read from $image" >&2
+	exit 1
+}
 docker buildx build "${args[@]}" "${labels[@]}" --tag "$image" --quiet "$@" "$here" >/dev/null
 docker image inspect "$image" --format '{{.Size}}' | awk -v i="$image" '{printf "%s: %.2f GB\n", i, $1 / 1e9}'

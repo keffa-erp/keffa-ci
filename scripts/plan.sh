@@ -28,11 +28,15 @@ published_commits() {
 }
 
 rows=()
+declare -A seen=()
 for line in $lines; do
 	python=$(line_python "$line") || {
 		echo "unknown line $line" >&2
 		exit 2
 	}
+	# Only one job may publish this line's tag for a given workflow run and attempt.
+	[ "${seen[$line]:-}" != 1 ] || continue
+	seen[$line]=1
 	row=$(jq -nc --arg line "$line" --arg python "$python" --arg node "$(line_node "$line")" \
 		'{line: $line, python: $python, node: $node}')
 	wanted=""
